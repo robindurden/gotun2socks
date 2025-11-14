@@ -1,5 +1,8 @@
 package gotun2socks
 
+// gotun2socks 封装了 tun2socks 的核心调度逻辑：读取 TUN 设备的原始 IP
+// 数据包，解析 TCP/UDP 后交给连接跟踪器处理，再通过 SOCKS5 代理写回。
+
 import (
 	"io"
 	"log"
@@ -12,6 +15,7 @@ import (
 )
 
 const (
+	// MTU 表示 TUN 设备每次可读写的最大包长，池化缓冲区同样基于该值。
 	MTU = 1500
 )
 
@@ -26,11 +30,13 @@ var (
 	_, ip3, _ = net.ParseCIDR("192.168.0.0/24")
 )
 
+// Tun2Socks 将 TUN 设备与本地 SOCKS 代理绑定起来，负责维护 TCP/UDP 状态。
 type Tun2Socks struct {
 	dev            io.ReadWriteCloser
 	localSocksAddr string
 	publicOnly     bool
 
+	// writerStopCh/ writeCh 组成单一写出口，避免多个 goroutine 并发写设备。
 	writerStopCh chan bool
 	writeCh      chan interface{}
 
@@ -46,6 +52,7 @@ type Tun2Socks struct {
 	wg sync.WaitGroup
 }
 
+// isPrivate 判断目的地址是否落在私网段，用于 publicOnly 模式。
 func isPrivate(ip net.IP) bool {
 	return ip1.Contains(ip) || ip2.Contains(ip) || ip3.Contains(ip)
 }
@@ -54,6 +61,7 @@ func dialLocalSocks(localAddr string) (*gosocks.SocksConn, error) {
 	return localSocksDialer.Dial(localAddr)
 }
 
+// New 初始化 Tun2Socks，对象内部会根据配置动态开启 DNS 缓存。
 func New(dev io.ReadWriteCloser, localSocksAddr string, dnsServers []string, publicOnly bool, enableDnsCache bool) *Tun2Socks {
 	t2s := &Tun2Socks{
 		dev:             dev,
@@ -73,6 +81,7 @@ func New(dev io.ReadWriteCloser, localSocksAddr string, dnsServers []string, pub
 	return t2s
 }
 
+// Stop 停止读写循环，并依次通知 TCP/UDP 连接协程退出。
 func (t2s *Tun2Socks) Stop() {
 	t2s.writerStopCh <- true
 	t2s.dev.Close()
@@ -91,6 +100,7 @@ func (t2s *Tun2Socks) Stop() {
 	t2s.wg.Wait()
 }
 
+// Run 启动 writer（写 TUN）与 reader（读 TUN）循环，常驻阻塞直至停止。
 func (t2s *Tun2Socks) Run() {
 	// writer
 	go func() {
@@ -142,6 +152,7 @@ func (t2s *Tun2Socks) Run() {
 			continue
 		}
 		if t2s.publicOnly {
+			// 仅允许公网目的地址，常用于旁路塑型以防内网回环。
 			if !ip.DstIP.IsGlobalUnicast() {
 				continue
 			}
@@ -151,6 +162,7 @@ func (t2s *Tun2Socks) Run() {
 		}
 
 		if ip.Flags&0x1 != 0 || ip.FragOffset != 0 {
+			// 简易片段重组，等待最后一个分片后再继续协议解析。
 			last, pkt, raw := procFragment(&ip, data)
 			if last {
 				ip = *pkt

@@ -1,5 +1,7 @@
 package main
 
+// 命令行入口，负责解析参数、初始化 TUN 设备，并启动 Tun2Socks。
+
 import (
 	"flag"
 	"log"
@@ -30,6 +32,7 @@ func main() {
 	flag.BoolVar(&publicOnly, "public-only", false, "only forward packets with public address destination")
 	flag.BoolVar(&enableDnsCache, "enable-dns-cache", false, "enable local dns cache if specified")
 	flag.Parse()
+	// 允许通过逗号指定多个 DNS 服务器，按顺序写入 TUN。
 
 	dnsServers := strings.Split(tunDNS, ",")
 	f, e := tun.OpenTunDevice(tunDevice, tunAddr, tunGW, tunMask, dnsServers)

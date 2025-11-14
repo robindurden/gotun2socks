@@ -1,5 +1,7 @@
 package gotun2socks
 
+// ip.go 提供 IP 分片重组与重新分片的辅助工具，供 TCP/UDP 层复用。
+
 import (
 	"log"
 	"net"
@@ -7,6 +9,7 @@ import (
 	"github.com/yinghuocho/gotun2socks/internal/packet"
 )
 
+// ipPacket 表示一个可直接写回 TUN 的 IP frame，包含序列化后的字节。
 type ipPacket struct {
 	ip     *packet.IPv4
 	mtuBuf []byte
@@ -14,9 +17,11 @@ type ipPacket struct {
 }
 
 var (
+	// frags 以 IPID 为 key 暂存片段，仅在单进程环境下使用。
 	frags = make(map[uint16]*ipPacket)
 )
 
+// procFragment 将分片拼接起来，返回是否到达最后一个片段。
 func procFragment(ip *packet.IPv4, raw []byte) (bool, *packet.IPv4, []byte) {
 	exist, ok := frags[ip.Id]
 	if !ok {
@@ -50,6 +55,7 @@ func procFragment(ip *packet.IPv4, raw []byte) (bool, *packet.IPv4, []byte) {
 	}
 }
 
+// genFragments 根据第一片和剩余数据生成新的分片列表。
 func genFragments(first *packet.IPv4, offset uint16, data []byte) []*ipPacket {
 	var ret []*ipPacket
 	for {
@@ -93,6 +99,7 @@ func genFragments(first *packet.IPv4, offset uint16, data []byte) []*ipPacket {
 	}
 }
 
+// releaseIPPacket 将 IP 头和缓冲区归还池，防止内存泄漏。
 func releaseIPPacket(pkt *ipPacket) {
 	packet.ReleaseIPv4(pkt.ip)
 	if pkt.mtuBuf != nil {

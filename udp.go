@@ -1,5 +1,8 @@
 package gotun2socks
 
+// 本文件实现 UDP 数据通道：负责缓存 DNS 响应、通过 SOCKS5 UDP Associate
+// 与代理建立通信，并在需要时对超长报文做分片。
+
 import (
 	"fmt"
 	"log"
@@ -14,6 +17,7 @@ import (
 	"github.com/yinghuocho/gotun2socks/internal/packet"
 )
 
+// udpPacket 保存 IP/UDP 头部以及复用的缓冲区，用于回写 TUN。
 type udpPacket struct {
 	ip     *packet.IPv4
 	udp    *packet.UDP
@@ -21,6 +25,7 @@ type udpPacket struct {
 	wire   []byte
 }
 
+// udpConnTrack 维护一条 UDP 会话，与 TCP 不同主要是按需创建并带超时。
 type udpConnTrack struct {
 	t2s *Tun2Socks
 	id  string
@@ -42,6 +47,7 @@ type udpConnTrack struct {
 }
 
 var (
+	// udpPacketPool 复用 udpPacket，减轻 GC 压力。
 	udpPacketPool = &sync.Pool{
 		New: func() interface{} {
 			return &udpPacket{}
@@ -49,10 +55,12 @@ var (
 	}
 )
 
+// newUDPPacket 从对象池获取封装结构。
 func newUDPPacket() *udpPacket {
 	return udpPacketPool.Get().(*udpPacket)
 }
 
+// releaseUDPPacket 释放 packet/header/缓冲区。
 func releaseUDPPacket(pkt *udpPacket) {
 	packet.ReleaseIPv4(pkt.ip)
 	packet.ReleaseUDP(pkt.udp)
@@ -64,6 +72,7 @@ func releaseUDPPacket(pkt *udpPacket) {
 	udpPacketPool.Put(pkt)
 }
 
+// udpConnID 以 4 元组标识 UDP 会话。
 func udpConnID(ip *packet.IPv4, udp *packet.UDP) string {
 	return strings.Join([]string{
 		ip.SrcIP.String(),
@@ -73,6 +82,7 @@ func udpConnID(ip *packet.IPv4, udp *packet.UDP) string {
 	}, "|")
 }
 
+// copyUDPPacket 深拷贝原始数据，避免并发修改冲突。
 func copyUDPPacket(raw []byte, ip *packet.IPv4, udp *packet.UDP) *udpPacket {
 	iphdr := packet.NewIPv4()
 	udphdr := packet.NewUDP()
@@ -96,6 +106,7 @@ func copyUDPPacket(raw []byte, ip *packet.IPv4, udp *packet.UDP) *udpPacket {
 	return pkt
 }
 
+// responsePacket 根据请求元信息拼装响应包，必要时返回附加分片。
 func responsePacket(local net.IP, remote net.IP, lPort uint16, rPort uint16, respPayload []byte) (*udpPacket, []*ipPacket) {
 	ipid := packet.IPID()
 
@@ -150,6 +161,7 @@ func responsePacket(local net.IP, remote net.IP, lPort uint16, rPort uint16, res
 	return pkt, frags
 }
 
+// send 将 SOCKS 返回的数据写回 TUN，包括潜在的 IP 分片。
 func (ut *udpConnTrack) send(data []byte) {
 	pkt, fragments := responsePacket(ut.localIP, ut.remoteIP, ut.localPort, ut.remotePort, data)
 	ut.toTunCh <- pkt
@@ -160,6 +172,7 @@ func (ut *udpConnTrack) send(data []byte) {
 	}
 }
 
+// run 维护 UDP 会话生命周期，负责 SOCKS 握手、超时和缓存。
 func (ut *udpConnTrack) run() {
 	// connect to socks
 	var e error
@@ -335,6 +348,7 @@ func (ut *udpConnTrack) run() {
 	}
 }
 
+// newPacket 将 TUN 侧的 UDP 包交给会话循环，如果已退出则丢弃。
 func (ut *udpConnTrack) newPacket(pkt *udpPacket) {
 	select {
 	case <-ut.quitByOther:
@@ -344,6 +358,7 @@ func (ut *udpConnTrack) newPacket(pkt *udpPacket) {
 	}
 }
 
+// clearUDPConnTrack 释放指定 UDP 会话。
 func (t2s *Tun2Socks) clearUDPConnTrack(id string) {
 	t2s.udpConnTrackLock.Lock()
 	defer t2s.udpConnTrackLock.Unlock()
@@ -352,6 +367,7 @@ func (t2s *Tun2Socks) clearUDPConnTrack(id string) {
 	log.Printf("tracking %d UDP connections", len(t2s.udpConnTrackMap))
 }
 
+// getUDPConnTrack 复用或新建 UDP 会话，按需启动 run 循环。
 func (t2s *Tun2Socks) getUDPConnTrack(id string, ip *packet.IPv4, udp *packet.UDP) *udpConnTrack {
 	t2s.udpConnTrackLock.Lock()
 	defer t2s.udpConnTrackLock.Unlock()
@@ -386,6 +402,7 @@ func (t2s *Tun2Socks) getUDPConnTrack(id string, ip *packet.IPv4, udp *packet.UD
 	}
 }
 
+// udp 为 TUN 侧入口，包含 DNS 缓存快捷路径。
 func (t2s *Tun2Socks) udp(raw []byte, ip *packet.IPv4, udp *packet.UDP) {
 	var buf [1024]byte
 	var done bool
@@ -419,11 +436,13 @@ func (t2s *Tun2Socks) udp(raw []byte, ip *packet.IPv4, udp *packet.UDP) {
 	}
 }
 
+// dnsCacheEntry 储存 DNS 响应与过期时间。
 type dnsCacheEntry struct {
 	msg *dns.Msg
 	exp time.Time
 }
 
+// dnsCache 是简易内存缓存，用于减少频繁的 DNS 请求。
 type dnsCache struct {
 	servers []string
 	mutex   sync.Mutex
@@ -432,10 +451,12 @@ type dnsCache struct {
 
 func packUint16(i uint16) []byte { return []byte{byte(i >> 8), byte(i)} }
 
+// cacheKey 使用域名+Type 作为唯一键。
 func cacheKey(q dns.Question) string {
 	return string(append([]byte(q.Name), packUint16(q.Qtype)...))
 }
 
+// isDNS 判断会话是否为目标 DNS 服务器的请求。
 func (t2s *Tun2Socks) isDNS(remoteIP string, remotePort uint16) bool {
 	if remotePort != 53 {
 		return false
@@ -448,6 +469,7 @@ func (t2s *Tun2Socks) isDNS(remoteIP string, remotePort uint16) bool {
 	return false
 }
 
+// query 解析请求报文，并尝试返回命中缓存。
 func (c *dnsCache) query(payload []byte) *dns.Msg {
 	request := new(dns.Msg)
 	e := request.Unpack(payload)
@@ -473,6 +495,7 @@ func (c *dnsCache) query(payload []byte) *dns.Msg {
 	return entry.msg
 }
 
+// store 将成功响应写入缓存，TTL 与应答记录一致。
 func (c *dnsCache) store(payload []byte) {
 	resp := new(dns.Msg)
 	e := resp.Unpack(payload)
